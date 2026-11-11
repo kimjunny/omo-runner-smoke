@@ -1,0 +1,94 @@
+# omo research lane on a GitHub-hosted runner.
+# The prompt arrives encrypted (workflow_dispatch inputs are visible to anyone on a public repo)
+# and the result leaves encrypted, so neither the input nor the output is readable from the run page.
+name: research-lane
+run-name: research ${{ inputs.job_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      prompt_enc:
+        description: "base64 of openssl aes-256-cbc -pbkdf2 encrypted prompt (passphrase = RUNNER_PASS secret)"
+        required: true
+      model:
+        description: "omo model id"
+        default: "system24/deepseek-v4.1-flash-1m"
+      job_id:
+        description: "caller-side job id, used in the artifact name"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      OMO_VERSION: "5.1.69"
+    steps:
+      - name: Runner spec
+        run: |
+          echo "nproc=$(nproc)"
+          free -h | head -2
+          df -h / | tail -1
+          echo "started=$(date -u +%FT%TZ)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install omo
+        run: bun add -g "omo-ai@${OMO_VERSION}" > /dev/null 2>&1 && echo "omo installed"
+
+      - name: Write provider config (key stays in the file, never echoed)
+        env:
+          SYSTEM24_KEY: ${{ secrets.SYSTEM24_KEY }}
+        run: |
+          mkdir -p ~/.omo
+          jq -n --arg k "$SYSTEM24_KEY" '{providers:{system24:{
+            baseUrl:"https://ds-api.system24.net/v1", apiKey:$k, api:"openai-completions",
+            models:[{id:"deepseek-v4.1-flash-1m",name:"DeepSeek V4.1 Flash 1M (system24)",reasoning:true,
+              input:["text"],contextWindow:1000000,maxTokens:32000,
+              compat:{supportsReasoningEffort:true,supportedReasoningEfforts:["low","high","max"],maxTokensField:"max_tokens"},
+              thinkingLevelMap:{low:"low",medium:"high",high:"high",xhigh:"max",max:"max"}}]}}}' > ~/.omo/models.json
+          chmod 600 ~/.omo/models.json
+          echo "config written"
+
+      - name: Decrypt prompt
+        env:
+          RUNNER_PASS: ${{ secrets.RUNNER_PASS }}
+          PROMPT_ENC: ${{ inputs.prompt_enc }}
+        run: |
+          mkdir -p work out
+          printf '%s' "$PROMPT_ENC" | openssl enc -d -aes-256-cbc -pbkdf2 -a -A -pass env:RUNNER_PASS > work/prompt.md
+          echo "prompt bytes=$(wc -c < work/prompt.md)"
+
+      - name: Run lane (stdout/stderr go to files only)
+        working-directory: work
+        run: |
+          set +e
+          omo -p --no-session --model "${{ inputs.model }}" --thinking low "$(cat prompt.md)" > ../out/result.md 2> ../out/stderr.log
+          echo "exit=$?" | tee ../out/exit.txt
+          echo "result bytes=$(wc -c < ../out/result.md) stderr bytes=$(wc -c < ../out/stderr.log)"
+          echo "finished=$(date -u +%FT%TZ)"
+
+      - name: Encrypt result
+        env:
+          RUNNER_PASS: ${{ secrets.RUNNER_PASS }}
+        run: |
+          tar -czf out.tgz out
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:RUNNER_PASS -in out.tgz -out result.tgz.enc
+          rm -rf out out.tgz work ~/.omo
+          ls -l result.tgz.enc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.job_id }}
+          path: result.tgz.enc
+          retention-days: 1
